@@ -1,0 +1,13 @@
+# Build output
+backend/bin/
+backend/obj/
+frontend/dist/
+frontend/node_modules/
+frontend/dist-test/
+
+# Tooling / cache
+.npm-cache/
+*.user
+
+# Temp test artifacts
+# (keep test-client.mjs — it is a useful integration test)
