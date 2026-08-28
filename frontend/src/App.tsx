@@ -16,12 +16,41 @@ interface ScanResult {
   findings: PdfFinding[];
 }
 
-// The Vite dev server proxies /api -> http://localhost:5111 (see vite.config.ts)
-// so the browser never needs to know the absolute backend URL.
-const API_URL = "http://localhost:5111/api/pdf/validate";
+// Use the same-origin Vite proxy in development and the deployed origin in production.
+// An explicit URL can still be supplied for split deployments.
+const API_URL = import.meta.env.VITE_API_URL?.trim() || "/api/pdf/validate";
+const MAX_FILE_BYTES = Number(import.meta.env.VITE_MAX_PDF_BYTES) || 10 * 1024 * 1024;
 
 const severityColor = (severity: string) =>
   severity.toLowerCase() === "high" ? "var(--danger)" : "var(--warn)";
+
+function isScanResult(value: unknown): value is ScanResult {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<ScanResult>;
+  return (
+    typeof candidate.allowed === "boolean" &&
+    typeof candidate.isValidPdf === "boolean" &&
+    typeof candidate.summary === "string" &&
+    typeof candidate.sizeBytes === "number" &&
+    Array.isArray(candidate.reasons) &&
+    Array.isArray(candidate.findings)
+  );
+}
+
+function apiErrorMessage(payload: unknown, status: number): string {
+  if (typeof payload === "object" && payload !== null) {
+    const problem = payload as { title?: unknown; detail?: unknown; errors?: unknown };
+    if (typeof problem.detail === "string") return problem.detail;
+    if (typeof problem.title === "string") return problem.title;
+    if (typeof problem.errors === "object" && problem.errors !== null) {
+      const messages = Object.values(problem.errors)
+        .flatMap((value) => (Array.isArray(value) ? value : []))
+        .filter((value): value is string => typeof value === "string");
+      if (messages.length > 0) return messages.join(" ");
+    }
+  }
+  return `Server responded with HTTP ${status}.`;
+}
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -46,15 +75,23 @@ export default function App() {
       form.append("file", file);
 
       const res = await fetch(API_URL, { method: "POST", body: form });
-      const payload = (await res.json()) as ScanResult;
-
-      // The API returns HTTP 200 with allowed=false for blocked files.
-      // Treat an HTTP error only as a transport/protocol failure below.
-      if (!res.ok && payload == null) {
-        throw new Error(`Server responded with ${res.status}`);
+      const responseText = await res.text();
+      let payload: unknown = null;
+      if (responseText) {
+        try {
+          payload = JSON.parse(responseText);
+        } catch {
+          throw new Error(`The server returned an invalid response (HTTP ${res.status}).`);
+        }
       }
 
-      setResult(payload);
+      if (isScanResult(payload)) {
+        setResult(payload);
+      } else if (!res.ok) {
+        throw new Error(apiErrorMessage(payload, res.status));
+      } else {
+        throw new Error("The server response did not match the PDF scan contract.");
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Network error reaching the API.";
@@ -77,7 +114,17 @@ export default function App() {
           type="file"
           accept="application/pdf,.pdf"
           onChange={(e) => {
-            setFile(e.target.files?.[0] ?? null);
+            const selected = e.target.files?.[0] ?? null;
+            if (selected && selected.size > MAX_FILE_BYTES) {
+              setFile(null);
+              setTransportError(
+                `The selected file exceeds the ${Math.floor(MAX_FILE_BYTES / 1024 / 1024)} MB limit.`,
+              );
+              e.target.value = "";
+              setResult(null);
+              return;
+            }
+            setFile(selected);
             setResult(null);
             setTransportError(null);
           }}

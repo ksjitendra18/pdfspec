@@ -12,6 +12,18 @@ public sealed class PdfSecurityOptions
     /// <summary>Cap on how many decompressed bytes we inspect per FlateDecode stream.</summary>
     public int MaxInflateBytes { get; set; } = 2 * 1024 * 1024;
 
+    /// <summary>Maximum decoded bytes across all streams in one document.</summary>
+    public int MaxTotalInflateBytes { get; set; } = 8 * 1024 * 1024;
+
+    /// <summary>Maximum number of stream objects inspected in one document.</summary>
+    public int MaxStreamCount { get; set; } = 256;
+
+    /// <summary>Maximum permitted expansion ratio for a decoded stream.</summary>
+    public int MaxCompressionRatio { get; set; } = 200;
+
+    /// <summary>Maximum number of findings returned for one document.</summary>
+    public int MaxFindings { get; set; } = 100;
+
     /// <summary>Reject files containing scripts (Acrobat /JavaScript, app.*, DOM script APIs...).</summary>
     public bool BlockJavaScript { get; set; } = true;
 
@@ -29,6 +41,15 @@ public sealed class PdfSecurityOptions
 
     /// <summary>Require a PDF magic header before inspecting the document.</summary>
     public bool RequirePdfHeader { get; set; } = true;
+
+    /// <summary>Require a trailer EOF marker and basic catalog/page-tree structure.</summary>
+    public bool RequirePdfStructure { get; set; } = true;
+
+    /// <summary>Reject encrypted PDFs because their strings and streams cannot be inspected.</summary>
+    public bool RejectEncryptedPdf { get; set; } = true;
+
+    /// <summary>Reject a filtered stream when it cannot be decoded safely.</summary>
+    public bool RejectUnscannableStreams { get; set; } = true;
 
     /// <summary>Number of leading bytes to scan for the "%PDF-" magic header.</summary>
     public int HeaderScanBytes { get; set; } = 1024;

@@ -2,7 +2,7 @@
 // POST a FormData with a 'file' field to /api/pdf/validate and read the verdict.
 import { readFileSync } from 'node:fs'
 
-const API = 'http://localhost:5111/api/pdf/validate'
+const API = process.env.PDF_SECURITY_API ?? 'http://localhost:5111/api/pdf/validate'
 
 async function scan(name, data) {
   const form = new FormData()
@@ -19,7 +19,7 @@ async function scan(name, data) {
 
 async function main() {
   // 1. Benign PDF -> expected allowed=true
-  const benign = readFileSync('D:/pdfsecurity/benign.pdf')
+  const benign = readFileSync(new URL('./benign.pdf', import.meta.url))
   const allowedBenign = await scan('benign.pdf', benign)
 
   // 2. Malicious PDF built in memory (matches the GitHub payloads' technique) -> allowed=false
@@ -34,15 +34,42 @@ async function main() {
   )
   const allowedMalicious = await scan('payload-malicious.pdf', malicious)
 
+  // 3. Standard PDF name escapes and a hexadecimal JavaScript string must not bypass scanning.
+  const escaped = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /Open#41ction 4 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>',
+    '<< /S /J#61vaScript /J#53 <6170702e616c657274283129> >>'
+  ])
+  const allowedEscaped = await scan('payload-escaped.pdf', escaped)
+
   console.log('\n===================== RESULT =====================')
   console.log(`benign allowed    : ${allowedBenign}   (expect true)`)
   console.log(`malicious allowed : ${allowedMalicious}   (expect false)`)
+  console.log(`escaped allowed   : ${allowedEscaped}   (expect false)`)
 
-  if (allowedBenign !== true || allowedMalicious !== false) {
-    console.log('FAIL: expected benign=true and malicious=false')
+  if (allowedBenign !== true || allowedMalicious !== false || allowedEscaped !== false) {
+    console.log('FAIL: one or more API contract checks did not match')
     process.exit(1)
   }
   console.log('PASS: frontend request contract works as expected.')
+}
+
+function buildPdf(objects) {
+  let document = '%PDF-1.7\n'
+  const offsets = [0]
+  for (let index = 0; index < objects.length; index++) {
+    offsets.push(Buffer.byteLength(document, 'latin1'))
+    document += `${index + 1} 0 obj\n${objects[index]}\nendobj\n`
+  }
+  const xrefOffset = Buffer.byteLength(document, 'latin1')
+  document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets.slice(1)) {
+    document += `${String(offset).padStart(10, '0')} 00000 n \n`
+  }
+  document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`
+  document += `startxref\n${xrefOffset}\n%%EOF\n`
+  return Buffer.from(document, 'latin1')
 }
 
 main().catch((e) => {

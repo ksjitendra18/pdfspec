@@ -1,6 +1,6 @@
 # Build output
-backend/bin/
-backend/obj/
+**/bin/
+**/obj/
 frontend/dist/
 frontend/node_modules/
 frontend/dist-test/

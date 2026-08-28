@@ -6,27 +6,12 @@ using Microsoft.Extensions.Options;
 namespace PdfSecurityApi.Security;
 
 /// <summary>
-/// <para>
-/// Static-free, injectable PDF scanner. It inspects the raw bytes of an uploaded PDF and
-/// rejects anything that looks dangerous:
-/// </para>
-/// <list type="bullet">
-///   <item>embedded JavaScript (Acrobat <c>/JS</c>, <c>app.*</c>, DOM script APIs),</item>
-///   <item>external / dangerous links (<c>/URI</c>, <c>data:</c>, <c>javascript:</c>, <c>file:</c>, <c>http(s)://</c>),</item>
-///   <item>OS command execution attempts (URI launch actions, Windows command paths),</item>
-///   <item>embedded / attached files,</item>
-///   <item>HTML / XSS injection smuggled inside annotations or <c>/FontMatrix</c>.</item>
-/// </list>
-/// <para>
-/// It scans both the raw byte stream and the contents of any <c>FlateDecode</c> streams so that
-/// hidden payloads are not missed when a generator compresses a dangerous dictionary.
-/// </para>
+/// Performs bounded, fail-closed inspection of PDF syntax and decoded general-purpose streams.
+/// This is a policy gate, not a guarantee that a PDF viewer has no parser vulnerabilities.
 /// </summary>
 public sealed class PdfSecurity
 {
-    /// <summary>PDF magic header required at the start of a valid document.</summary>
     private const string PdfMagic = "%PDF-";
-
     private readonly PdfSecurityOptions _options;
     private readonly IReadOnlyList<PdfRule> _rules;
 
@@ -36,105 +21,105 @@ public sealed class PdfSecurity
         _rules = BuildRules();
     }
 
-    /// <summary>
-    /// Validate an uploaded PDF. Returns <see cref="PdfValidationResult.IsAllowed"/> = false
-    /// when the document is not a PDF, exceeds the size limit, or contains dangerous content.
-    /// </summary>
-    /// <param name="data">Raw file bytes (already read from the request stream).</param>
-    /// <param name="fileName">Original file name for diagnostics.</param>
-    public PdfValidationResult Validate(byte[] data, string? fileName = null)
-    {
-        long size = data?.LongLength ?? 0;
+    public PdfValidationResult Validate(byte[] data, string? fileName = null) =>
+        Validate(data, data?.Length ?? 0, fileName, CancellationToken.None);
 
-        if (data is null || data.Length == 0)
+    /// <summary>Validate a populated prefix of a byte buffer without another full-size copy.</summary>
+    public PdfValidationResult Validate(
+        byte[] data,
+        int length,
+        string? fileName = null,
+        CancellationToken cancellationToken = default)
+    {
+        long size = length;
+        if (data is null || length <= 0 || length > data.Length)
         {
-            return PdfValidationResult.Rejected(false, fileName, size, "Empty upload.", [new PdfFinding("EmptyFile", "High", "The uploaded file is empty.")]);
+            return PdfValidationResult.Rejected(false, fileName, Math.Max(0, size), "Empty or invalid upload.",
+                [new PdfFinding("InvalidFile", "High", "The uploaded byte buffer is empty or invalid.")]);
         }
 
         if (size > _options.MaxFileSizeBytes)
         {
-            return PdfValidationResult.Rejected(false, fileName, size,
-                "File too large.",
-                [new PdfFinding("FileTooLarge", "High", $"File is {size:N0} bytes; the maximum allowed size is {_options.MaxFileSizeBytes:N0} bytes.")]);
+            return PdfValidationResult.Rejected(false, fileName, size, "File too large.",
+                [new PdfFinding("FileTooLarge", "High",
+                    $"File is {size:N0} bytes; the maximum is {_options.MaxFileSizeBytes:N0} bytes.")]);
         }
 
-        // 1. Basic PDF magic check.
-        if (_options.RequirePdfHeader && !HasPdfMagic(data))
+        cancellationToken.ThrowIfCancellationRequested();
+        var bytes = data.AsSpan(0, length);
+        bool hasHeader = HasPdfMagic(bytes);
+        if (_options.RequirePdfHeader && !hasHeader)
         {
-            return PdfValidationResult.Rejected(false, fileName, size,
-                "Not a valid PDF.",
-                [new PdfFinding("MissingPdfHeader", "High", "The file does not start with the '%PDF-' header and is not a recognised PDF.")]);
+            return PdfValidationResult.Rejected(false, fileName, size, "Not a valid PDF.",
+                [new PdfFinding("MissingPdfHeader", "High", "A valid PDF version header was not found.")]);
         }
 
-        // 2. Build the search corpus (raw + decompressed FlateDecode streams).
-        var corpus = BuildScanCorpus(data);
+        var corpusResult = BuildScanCorpus(data, length, cancellationToken);
+        var findings = corpusResult.Findings;
+        bool structurallyValid = hasHeader && ValidateStructure(bytes, corpusResult.Corpus, findings);
 
-        var findings = new List<PdfFinding>();
         foreach (var rule in _rules)
         {
-            if (!IsRuleEnabled(rule))
+            if (findings.Count >= _options.MaxFindings)
             {
-                continue;
+                break;
             }
 
-            AppendMatches(findings, rule, corpus);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsRuleEnabled(rule))
+            {
+                AppendMatches(findings, rule, corpusResult.Corpus);
+            }
         }
 
-        // 3. If no dangerous constructs remain, the file is safe to keep.
-        if (findings.Count == 0)
+        if (findings.Count == 0 && structurallyValid)
         {
-            return PdfValidationResult.Ok(fileName, size, "The PDF is safe to accept.");
+            return PdfValidationResult.Ok(fileName, size,
+                "No configured dangerous constructs were detected.");
         }
 
-        var summary = $"Blocked: {findings.Count} dangerous construct(s) detected.";
-        return PdfValidationResult.Rejected(true, fileName, size, summary, findings);
+        var summary = structurallyValid
+            ? $"Blocked: {findings.Count} dangerous or unscannable construct(s) detected."
+            : "Rejected: the upload is not a structurally valid, fully scannable PDF.";
+        return PdfValidationResult.Rejected(structurallyValid, fileName, size, summary, findings);
     }
 
-    // ---- Rule catalogue ---------------------------------------------------
+    private readonly record struct PdfRule(string Title, string Severity, Regex Regex, string Category);
 
-    private readonly record struct PdfRule(string Name, string Title, string Severity, string Pattern, string Category);
-
-    /// <summary>
-    /// Every dangerous construct the scanner knows about. Each rule belongs to a category that maps to a
-    /// toggle in <see cref="PdfSecurityOptions"/> (e.g. <see cref="PdfSecurityOptions.BlockJavaScript"/>).
-    /// </summary>
     private static IReadOnlyList<PdfRule> BuildRules() =>
     [
-        // Embedded JavaScript
-        new("EmbeddedJavaScript", "Embedded JavaScript", "High", @"(?:/JS\s*\(|/JavaScript\s*\(|/JS\s*\()", "javascript"),
-        new("AcrobatJavaScriptApi", "Acrobat JavaScript API", "High", @"app\s*\.\s*(?:alert|launchURL|openDoc|execMenuItem|exportDataObject|mailForm|goBack|openFDF|newDoc|media)\b", "javascript"),
-        new("DomScriptExecution", "DOM script execution", "High", @"(?:document\s*\.\s*(?:write|cookie|createElement|getElementById|querySelector)\b|window\s*\.\s*(?:confirm|alert|open|eval)\b|console\s*\.\s*println\b)", "javascript"),
-        new("ScriptFunctionCall", "Script function call", "High", @"\b(?:confirm|prompt|alert)\s*\(\s*", "javascript"),
-        new("EvalOrFunction", "Dynamic code evaluation", "High", @"\beval\s*\(|new\s+Function\s*\(|\.constructor\s*=\s*null", "javascript"),
-        new("XfaJavaScript", "XFA form scripting", "High", @"\b/XFA\b", "javascript"),
-        new("OpenAction", "Open-action script trigger", "High", @"/OpenAction\b", "javascript"),
+        Rule("JavaScript action", "High", @"(?:/S\s*/JavaScript\b|/JavaScript\b|/JS\b)", "javascript"),
+        Rule("Acrobat JavaScript API", "High", @"app\s*\.\s*(?:alert|launchURL|openDoc|execMenuItem|exportDataObject|mailForm|goBack|openFDF|newDoc|media)\b", "javascript"),
+        Rule("DOM script execution", "High", @"(?:document\s*\.\s*(?:write|cookie|createElement|getElementById|querySelector)\b|window\s*\.\s*(?:confirm|alert|open|eval)\b|console\s*\.\s*println\b)", "javascript"),
+        Rule("Script function call", "High", @"\b(?:confirm|prompt|alert)\s*\(", "javascript"),
+        Rule("Dynamic code evaluation", "High", @"\beval\s*\(|new\s+Function\s*\(|\.constructor\s*=\s*null", "javascript"),
+        Rule("XFA form", "High", @"/XFA\b", "javascript"),
 
-        // External / dangerous links
-        new("DataUri", "Data: URI", "High", @"\bdata\s*:\s*text/", "links"),
-        new("JavascriptUri", "javascript: URI", "High", @"\bjavascript\s*:\s*", "links"),
-        new("VbscriptUri", "vbscript: URI", "High", @"\bvbscript\s*:\s*", "links"),
-        new("FileUri", "file: URI", "High", @"\bfile\s*:\s*///*", "links"),
-        new("UriAction", "External URI action", "Medium", @"(?:/URI\s*\(|\bURIAction\b|\b/SubmitForm\b|\b/ImportData\b)", "links"),
-        new("ExternalHttpLink", "External http(s) link", "Medium", @"https?://", "links"),
-        new("RemoteGoto", "Remote go-to link", "Medium", @"\b/GoToR\b|\b/GoToE\b", "links"),
+        Rule("Data URI", "High", @"\bdata\s*:\s*text/", "links"),
+        Rule("JavaScript URI", "High", @"\bjavascript\s*:\s*", "links"),
+        Rule("VBScript URI", "High", @"\bvbscript\s*:\s*", "links"),
+        Rule("File URI", "High", @"\bfile\s*:\s*///?", "links"),
+        Rule("External URI action", "Medium", @"(?:/URI\b|/SubmitForm\b|/ImportData\b)", "links"),
+        Rule("External HTTP link", "Medium", @"https?://", "links"),
+        Rule("Remote go-to link", "Medium", @"/(?:GoToR|GoToE)\b", "links"),
 
-        // Command execution
-        new("WindowsCommandExecution", "Windows command", "High", @"\b(?:calc\.exe|cmd\.exe|cmd\.com|command\.com|powershell(?:\.exe)?|mshta(?:\.exe)?|rundll32(?:\.exe)?|wscript\.exe|cscript\.exe|certutil|regsvr32|bitsadmin|cmstp)\b", "commands"),
-        new("CommandUri", "Command in URI", "High", @"\b(?:start|run)\b\s+[^\s]*(?:\.exe|\.com|\.bat|\.cmd|\.ps1)\b", "commands"),
-        new("AbsoluteWindowsPath", "Windows path/command", "High", @"[A-Za-z]:/\\(?:Windows|System32|Program Files|Users|ProgramData)", "commands"),
+        Rule("Windows command", "High", @"\b(?:calc\.exe|cmd\.exe|cmd\.com|command\.com|powershell(?:\.exe)?|mshta(?:\.exe)?|rundll32(?:\.exe)?|wscript\.exe|cscript\.exe|certutil|regsvr32|bitsadmin|cmstp)\b", "commands"),
+        Rule("Command URI", "High", @"\b(?:start|run)\b\s+[^\s]*(?:\.exe|\.com|\.bat|\.cmd|\.ps1)\b", "commands"),
+        Rule("Windows path", "High", @"[A-Za-z]:[/\\](?:Windows|System32|Program Files|Users|ProgramData)\b", "commands"),
 
-        // Embedded / attached files
-        new("EmbeddedFile", "Embedded file", "High", @"(?:/EmbeddedFile\b|/Filespec\b|/EF\b|/UF\b|/EmbeddedFiles\b)", "embedded"),
-        new("LaunchAction", "Launch action", "High", @"(?:/Launch\b|/S\s*/Launch\b)", "embedded"),
+        Rule("Embedded file", "High", @"/(?:EmbeddedFile|Filespec|EF|UF|EmbeddedFiles|Collection)\b", "embedded"),
+        Rule("Launch action", "High", @"(?:/Launch\b|/S\s*/Launch\b)", "embedded"),
+        Rule("Active multimedia", "High", @"/(?:RichMedia|Movie|Sound|Rendition|3D)\b", "embedded"),
 
-        // HTML / XSS injection inside annotations
-        new("HtmlInjection", "HTML/script injection", "High", @"(?:</?script\b|</?iframe\b|<svg\b|<details\b|<img\b)", "annotations"),
-        new("EventHandlerInjection", "Event-handler injection", "High", @"\bon(?:toggle|load|error|mouseover|click|focus|mouseenter|input|change|open|close)\s*=\s*(?:confirm|alert|prompt|eval|document|window)", "annotations"),
-        new("AnnotationPayload", "Annotation injection", "High", @"(?:'|"")\s*>\s*'?\s*>\s*<\s*(?:details|div|iframe|svg|img|script)", "annotations"),
-
-        // FontMatrix JS injection (e.g. PDF.js CVE-2024-4367 PoC)
-        new("FontMatrixInjection", "FontMatrix injection", "High", @"\/FontMatrix\b[^\]]{0,600}?\([^)]{0,200}?\)\s*;", "annotations"),
+        Rule("HTML/script injection", "High", @"(?:</?script\b|</?iframe\b|<svg\b|<details\b|<img\b)", "annotations"),
+        Rule("Event-handler injection", "High", @"\bon(?:toggle|load|error|mouseover|click|focus|mouseenter|input|change|open|close)\s*=", "annotations"),
+        Rule("FontMatrix injection", "High", @"/FontMatrix\b[^\]]{0,600}?\([^)]{0,200}?\)\s*;", "annotations")
     ];
+
+    private static PdfRule Rule(string title, string severity, string pattern, string category) =>
+        new(title, severity,
+            new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant,
+                TimeSpan.FromMilliseconds(250)), category);
 
     private bool IsRuleEnabled(PdfRule rule) => rule.Category switch
     {
@@ -146,154 +131,516 @@ public sealed class PdfSecurity
         _ => true
     };
 
-    // ---- Matching ----------------------------------------------------------
-
-    private static void AppendMatches(List<PdfFinding> findings, PdfRule rule, string corpus)
+    private void AppendMatches(List<PdfFinding> findings, PdfRule rule, string corpus)
     {
-        Regex regex;
         try
         {
-            regex = new Regex(rule.Pattern,
-                RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant,
-                TimeSpan.FromMilliseconds(300));
-        }
-        catch
-        {
-            return; // A bad pattern must never break validation.
-        }
-
-        int count = 0;
-        try
-        {
-            foreach (Match m in regex.Matches(corpus))
+            int count = 0;
+            foreach (Match match in rule.Regex.Matches(corpus))
             {
-                var sample = Collapse(m.Value);
-                findings.Add(new PdfFinding(rule.Title, rule.Severity, $"Found dangerous construct in PDF content — \"{sample}\"."));
-
-                if (++count >= 5)
+                findings.Add(new PdfFinding(rule.Title, rule.Severity,
+                    $"Found disallowed PDF content — \"{Collapse(match.Value)}\"."));
+                if (++count >= 5 || findings.Count >= _options.MaxFindings)
                 {
-                    break; // Do not blow up the response for a single highly-repeated construct.
+                    break;
                 }
             }
         }
         catch (RegexMatchTimeoutException)
         {
-            findings.Add(new PdfFinding(rule.Title, rule.Severity, $"Rule deadlined while scanning (pattern '{rule.Pattern}')."));
+            findings.Add(new PdfFinding("ScanTimeout", "High",
+                $"The {rule.Title} rule exceeded its processing deadline."));
         }
     }
 
     private static string Collapse(string value)
     {
-        if (string.IsNullOrEmpty(value))
-        {
-            return "";
-        }
-
         value = Regex.Replace(value, @"\s+", " ").Trim();
         return value.Length <= 90 ? value : value[..90] + "…";
     }
 
-    // ---- Corpus construction ----------------------------------------------
+    private sealed record CorpusResult(string Corpus, List<PdfFinding> Findings);
 
-    private string BuildScanCorpus(byte[] data)
+    private CorpusResult BuildScanCorpus(byte[] data, int length, CancellationToken cancellationToken)
     {
-        var sb = new StringBuilder(data.Length + (data.Length / 2));
-        sb.Append(Latin1(data.AsSpan()));
+        var findings = new List<PdfFinding>();
+        int maxCorpusChars = checked((int)Math.Min(int.MaxValue,
+            _options.MaxFileSizeBytes + _options.MaxTotalInflateBytes + 4L * 1024 * 1024));
+        var corpus = new BoundedCorpus(maxCorpusChars);
 
-        AppendInflatedStreams(data, sb);
-        return sb.ToString();
-    }
-
-    /// <summary>Latin-1 mapping keeps every byte value 1:1, so regexes see exact raw bytes regardless of encoding.</summary>
-    private static string Latin1(ReadOnlySpan<byte> bytes) => Encoding.Latin1.GetString(bytes);
-
-    private void AppendInflatedStreams(byte[] data, StringBuilder corpus)
-    {
-        var text = Latin1(data.AsSpan());
-        int searchFrom = 0;
-
-        while (searchFrom < data.Length)
-        {
-            int streamIdx = text.IndexOf("stream", searchFrom, StringComparison.Ordinal);
-            if (streamIdx < 0)
-            {
-                break;
-            }
-
-            int endIdx = text.IndexOf("endstream", streamIdx, StringComparison.Ordinal);
-            if (endIdx < 0)
-            {
-                break;
-            }
-
-            // Only decompress regions that declared a FlateDecode filter.
-            int headerStart = Math.Max(0, streamIdx - 512);
-            var header = text.Substring(headerStart, streamIdx - headerStart);
-            bool isFlate = header.Contains("FlateDecode", StringComparison.OrdinalIgnoreCase);
-
-            int dataStart = streamIdx + "stream".Length;
-            while (dataStart < endIdx && (data[dataStart] == (byte)'\r' || data[dataStart] == (byte)'\n'))
-            {
-                dataStart++;
-            }
-
-            int dataEnd = endIdx;
-            while (dataEnd > dataStart && (data[dataEnd - 1] == (byte)'\r' || data[dataEnd - 1] == (byte)'\n'))
-            {
-                dataEnd--;
-            }
-
-            if (isFlate && dataEnd > dataStart)
-            {
-                if (TryInflate(data, dataStart, dataEnd) is { } inflated)
-                {
-                    corpus.Append(inflated);
-                }
-            }
-
-            searchFrom = endIdx + "endstream".Length;
-        }
-    }
-
-    private string? TryInflate(byte[] data, int start, int end)
-    {
         try
         {
-            using var input = new MemoryStream(data, start, end - start, writable: false);
-            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
-            using var output = new MemoryStream();
+            AppendSegment(corpus, data.AsSpan(0, length));
+            AppendDecodedStreams(data, length, corpus, findings, cancellationToken);
+        }
+        catch (PdfScanException exception)
+        {
+            findings.Add(new PdfFinding(exception.Rule, "High", exception.Message));
+        }
 
-            var buffer = new byte[8192];
-            int total = 0;
-            int read;
-            while ((read = zlib.Read(buffer, 0, buffer.Length)) > 0)
+        return new CorpusResult(corpus.ToString(), findings);
+    }
+
+    private static void AppendSegment(BoundedCorpus corpus, ReadOnlySpan<byte> bytes)
+    {
+        var normalized = NormalizeNameEscapes(Encoding.Latin1.GetString(bytes));
+        corpus.Append(normalized);
+        AppendDecodedStrings(normalized, corpus);
+    }
+
+    private void AppendDecodedStreams(
+        byte[] data,
+        int length,
+        BoundedCorpus corpus,
+        List<PdfFinding> findings,
+        CancellationToken cancellationToken)
+    {
+        var rawText = Encoding.Latin1.GetString(data, 0, length);
+        int searchFrom = 0;
+        int streamCount = 0;
+        int totalDecoded = 0;
+
+        while (searchFrom < length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int streamIndex = FindStreamToken(rawText, searchFrom);
+            if (streamIndex < 0)
             {
-                output.Write(buffer, 0, read);
-                total += read;
-                if (total > _options.MaxInflateBytes)
+                break;
+            }
+
+            if (++streamCount > _options.MaxStreamCount)
+            {
+                throw new PdfScanException("TooManyStreams",
+                    $"The PDF contains more than {_options.MaxStreamCount} stream objects.");
+            }
+
+            int endIndex = rawText.IndexOf("endstream", streamIndex + 6, StringComparison.Ordinal);
+            if (endIndex < 0)
+            {
+                AddUnscannable(findings, streamCount, "The stream has no endstream marker.");
+                break;
+            }
+
+            int dataStart = streamIndex + 6;
+            if (dataStart < endIndex && data[dataStart] == '\r') dataStart++;
+            if (dataStart < endIndex && data[dataStart] == '\n') dataStart++;
+            int dataEnd = endIndex;
+            if (dataEnd > dataStart && data[dataEnd - 1] == '\n') dataEnd--;
+            if (dataEnd > dataStart && data[dataEnd - 1] == '\r') dataEnd--;
+
+            int dictionaryStart = rawText.LastIndexOf("<<", streamIndex, StringComparison.Ordinal);
+            string header = dictionaryStart >= 0 && streamIndex - dictionaryStart <= 8192
+                ? NormalizeNameEscapes(rawText[dictionaryStart..streamIndex])
+                : string.Empty;
+
+            var filters = ExtractFilters(header);
+            if (filters is null)
+            {
+                AddUnscannable(findings, streamCount, "The stream filter is indirect or malformed.");
+            }
+            else if (filters.Count > 0 && !IsOpaqueImageStream(header, filters))
+            {
+                try
                 {
-                    break;
+                    var decoded = DecodeFilters(data.AsSpan(dataStart, dataEnd - dataStart), filters,
+                        ref totalDecoded, cancellationToken);
+                    AppendSegment(corpus, decoded);
+                }
+                catch (Exception exception) when (exception is InvalidDataException or PdfScanException)
+                {
+                    AddUnscannable(findings, streamCount, exception.Message);
                 }
             }
 
-            // Decoded content must not temporarily hold more than the configured cap.
-            if (output.Length > _options.MaxInflateBytes)
-            {
-                return null;
-            }
-
-            return Latin1(output.ToArray());
-        }
-        catch
-        {
-            return null; // Not actually a FlateDecode stream (or corrupt) — ignore.
+            searchFrom = endIndex + "endstream".Length;
         }
     }
 
-    private bool HasPdfMagic(byte[] data)
+    private void AddUnscannable(List<PdfFinding> findings, int streamNumber, string detail)
     {
-        int scan = Math.Min(data.Length, Math.Max(1, _options.HeaderScanBytes));
-        var head = Latin1(data.AsSpan(0, scan));
-        return head.Contains(PdfMagic, StringComparison.Ordinal);
+        if (_options.RejectUnscannableStreams && findings.Count < _options.MaxFindings)
+        {
+            findings.Add(new PdfFinding("UnscannableStream", "High",
+                $"Stream {streamNumber} could not be inspected safely: {detail}"));
+        }
+    }
+
+    private static int FindStreamToken(string text, int start)
+    {
+        while (start < text.Length)
+        {
+            int index = text.IndexOf("stream", start, StringComparison.Ordinal);
+            if (index < 0) return -1;
+            bool before = index == 0 || IsPdfDelimiterOrWhiteSpace(text[index - 1]);
+            int afterIndex = index + 6;
+            bool after = afterIndex < text.Length && text[afterIndex] is '\r' or '\n';
+            if (before && after) return index;
+            start = index + 6;
+        }
+        return -1;
+    }
+
+    private static List<string>? ExtractFilters(string header)
+    {
+        int index = header.LastIndexOf("/Filter", StringComparison.Ordinal);
+        if (index < 0) return [];
+        index += "/Filter".Length;
+        while (index < header.Length && char.IsWhiteSpace(header[index])) index++;
+        if (index >= header.Length) return null;
+
+        string filterText;
+        if (header[index] == '[')
+        {
+            int end = header.IndexOf(']', index + 1);
+            if (end < 0 || end - index > 1024) return null;
+            filterText = header[(index + 1)..end];
+        }
+        else if (header[index] == '/')
+        {
+            int end = index + 1;
+            while (end < header.Length && !IsPdfDelimiterOrWhiteSpace(header[end])) end++;
+            filterText = header[index..end];
+        }
+        else
+        {
+            return null;
+        }
+
+        return Regex.Matches(filterText, @"/([A-Za-z0-9]+)")
+            .Select(match => match.Groups[1].Value)
+            .ToList();
+    }
+
+    private static bool IsOpaqueImageStream(string header, IReadOnlyList<string> filters) =>
+        filters.Count > 0 && Regex.IsMatch(header, @"/Subtype\s*/Image\b", RegexOptions.CultureInvariant);
+
+    private byte[] DecodeFilters(
+        ReadOnlySpan<byte> encoded,
+        IReadOnlyList<string> filters,
+        ref int totalDecoded,
+        CancellationToken cancellationToken)
+    {
+        byte[] current = encoded.ToArray();
+        foreach (string filter in filters)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int inputLength = current.Length;
+            current = filter switch
+            {
+                "FlateDecode" or "Fl" => Inflate(current, cancellationToken),
+                "ASCIIHexDecode" or "AHx" => DecodeAsciiHex(current),
+                "ASCII85Decode" or "A85" => DecodeAscii85(current),
+                "RunLengthDecode" or "RL" => DecodeRunLength(current),
+                _ => throw new InvalidDataException($"Unsupported stream filter /{filter}.")
+            };
+
+            if (current.Length > _options.MaxInflateBytes)
+            {
+                throw new PdfScanException("InflateLimitExceeded",
+                    $"Decoded stream exceeds {_options.MaxInflateBytes:N0} bytes.");
+            }
+            if (current.Length > Math.Max(1024L, inputLength) * _options.MaxCompressionRatio)
+            {
+                throw new PdfScanException("CompressionRatioExceeded",
+                    $"Decoded stream exceeds the {_options.MaxCompressionRatio}:1 expansion limit.");
+            }
+
+            totalDecoded = checked(totalDecoded + current.Length);
+            if (totalDecoded > _options.MaxTotalInflateBytes)
+            {
+                throw new PdfScanException("TotalInflateLimitExceeded",
+                    $"Decoded streams exceed the {_options.MaxTotalInflateBytes:N0}-byte document limit.");
+            }
+        }
+        return current;
+    }
+
+    private byte[] Inflate(byte[] input, CancellationToken cancellationToken)
+    {
+        using var source = new MemoryStream(input, writable: false);
+        using var zlib = new ZLibStream(source, CompressionMode.Decompress);
+        using var output = new MemoryStream(Math.Min(_options.MaxInflateBytes, 64 * 1024));
+        var buffer = new byte[8192];
+        int read;
+        while ((read = zlib.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (output.Length + read > _options.MaxInflateBytes)
+            {
+                throw new PdfScanException("InflateLimitExceeded",
+                    $"Decoded stream exceeds {_options.MaxInflateBytes:N0} bytes.");
+            }
+            output.Write(buffer, 0, read);
+        }
+        return output.ToArray();
+    }
+
+    private static byte[] DecodeAsciiHex(ReadOnlySpan<byte> input)
+    {
+        using var output = new MemoryStream(input.Length / 2);
+        int high = -1;
+        foreach (byte value in input)
+        {
+            if (char.IsWhiteSpace((char)value)) continue;
+            if (value == '>') break;
+            int nibble = HexValue((char)value);
+            if (nibble < 0) throw new InvalidDataException("Invalid ASCIIHex stream data.");
+            if (high < 0) high = nibble;
+            else { output.WriteByte((byte)((high << 4) | nibble)); high = -1; }
+        }
+        if (high >= 0) output.WriteByte((byte)(high << 4));
+        return output.ToArray();
+    }
+
+    private static byte[] DecodeAscii85(ReadOnlySpan<byte> input)
+    {
+        using var output = new MemoryStream(input.Length);
+        Span<byte> group = stackalloc byte[5];
+        int count = 0;
+        foreach (byte value in input)
+        {
+            if (char.IsWhiteSpace((char)value) || value == (byte)'<' || value == (byte)'>') continue;
+            if (value == '~') break;
+            if (value == 'z')
+            {
+                if (count != 0) throw new InvalidDataException("Invalid ASCII85 z shorthand.");
+                output.Write([0, 0, 0, 0]);
+                continue;
+            }
+            if (value is < 33 or > 117) throw new InvalidDataException("Invalid ASCII85 stream data.");
+            group[count++] = value;
+            if (count == 5) { WriteAscii85Group(output, group, 4); count = 0; }
+        }
+        if (count == 1) throw new InvalidDataException("Invalid final ASCII85 group.");
+        if (count > 1)
+        {
+            int outputCount = count - 1;
+            while (count < 5) group[count++] = (byte)'u';
+            WriteAscii85Group(output, group, outputCount);
+        }
+        return output.ToArray();
+    }
+
+    private static void WriteAscii85Group(Stream output, ReadOnlySpan<byte> group, int outputCount)
+    {
+        ulong number = 0;
+        for (int index = 0; index < 5; index++) number = number * 85 + (uint)(group[index] - 33);
+        if (number > uint.MaxValue) throw new InvalidDataException("ASCII85 group overflow.");
+        uint value = (uint)number;
+        Span<byte> bytes = stackalloc byte[4]
+        {
+            (byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value
+        };
+        output.Write(bytes[..outputCount]);
+    }
+
+    private static byte[] DecodeRunLength(ReadOnlySpan<byte> input)
+    {
+        using var output = new MemoryStream(input.Length);
+        int index = 0;
+        while (index < input.Length)
+        {
+            int length = input[index++];
+            if (length == 128) break;
+            if (length <= 127)
+            {
+                int count = length + 1;
+                if (index + count > input.Length) throw new InvalidDataException("Truncated RunLength stream.");
+                output.Write(input.Slice(index, count));
+                index += count;
+            }
+            else
+            {
+                if (index >= input.Length) throw new InvalidDataException("Truncated RunLength stream.");
+                byte value = input[index++];
+                for (int repeat = 0; repeat < 257 - length; repeat++) output.WriteByte(value);
+            }
+        }
+        return output.ToArray();
+    }
+
+    private bool ValidateStructure(ReadOnlySpan<byte> data, string corpus, List<PdfFinding> findings)
+    {
+        bool valid = true;
+        if (_options.RequirePdfStructure)
+        {
+            int tailLength = Math.Min(data.Length, 4096);
+            string tail = Encoding.Latin1.GetString(data[^tailLength..]);
+            valid &= Require(tail.Contains("%%EOF", StringComparison.Ordinal), findings,
+                "MissingEofMarker", "The PDF has no EOF marker near the end of the file.");
+            valid &= Require(corpus.Contains("/Catalog", StringComparison.Ordinal), findings,
+                "MissingCatalog", "The PDF catalog was not found.");
+            valid &= Require(corpus.Contains("/Pages", StringComparison.Ordinal), findings,
+                "MissingPageTree", "The PDF page tree was not found.");
+            valid &= Require(corpus.Contains("startxref", StringComparison.Ordinal), findings,
+                "MissingCrossReference", "The PDF has no startxref marker.");
+        }
+
+        if (_options.RejectEncryptedPdf && Regex.IsMatch(corpus, @"/Encrypt\b", RegexOptions.CultureInvariant))
+        {
+            findings.Add(new PdfFinding("EncryptedPdf", "High",
+                "Encrypted PDF strings and streams cannot be inspected without decryption."));
+            valid = false;
+        }
+
+        return valid && findings.All(finding =>
+            finding.Rule is not ("UnscannableStream" or "ScanBudgetExceeded" or "InflateLimitExceeded"));
+    }
+
+    private static bool Require(bool condition, List<PdfFinding> findings, string rule, string detail)
+    {
+        if (!condition) findings.Add(new PdfFinding(rule, "High", detail));
+        return condition;
+    }
+
+    private bool HasPdfMagic(ReadOnlySpan<byte> data)
+    {
+        int scanLength = Math.Min(data.Length, Math.Max(1, _options.HeaderScanBytes));
+        string header = Encoding.Latin1.GetString(data[..scanLength]);
+        int index = header.IndexOf(PdfMagic, StringComparison.Ordinal);
+        return index >= 0 && index + 8 <= header.Length &&
+               header[index + 5] is '1' or '2' && header[index + 6] == '.' && char.IsAsciiDigit(header[index + 7]);
+    }
+
+    private static string NormalizeNameEscapes(string text)
+    {
+        var output = new StringBuilder(text.Length);
+        for (int index = 0; index < text.Length; index++)
+        {
+            char current = text[index];
+            output.Append(current);
+            if (current != '/') continue;
+
+            while (++index < text.Length && !IsPdfDelimiterOrWhiteSpace(text[index]))
+            {
+                if (text[index] == '#' && index + 2 < text.Length)
+                {
+                    int high = HexValue(text[index + 1]);
+                    int low = HexValue(text[index + 2]);
+                    if (high >= 0 && low >= 0)
+                    {
+                        output.Append((char)((high << 4) | low));
+                        index += 2;
+                        continue;
+                    }
+                }
+                output.Append(text[index]);
+            }
+            if (index < text.Length) output.Append(text[index]);
+        }
+        return output.ToString();
+    }
+
+    private static void AppendDecodedStrings(string text, BoundedCorpus corpus)
+    {
+        for (int index = 0; index < text.Length; index++)
+        {
+            if (text[index] == '<' && (index + 1 >= text.Length || text[index + 1] != '<'))
+            {
+                var decoded = new StringBuilder();
+                int high = -1;
+                int cursor = index + 1;
+                bool valid = false;
+                for (; cursor < text.Length; cursor++)
+                {
+                    char value = text[cursor];
+                    if (value == '>') { valid = true; break; }
+                    if (char.IsWhiteSpace(value)) continue;
+                    int nibble = HexValue(value);
+                    if (nibble < 0) break;
+                    if (high < 0) high = nibble;
+                    else { decoded.Append((char)((high << 4) | nibble)); high = -1; }
+                }
+                if (valid)
+                {
+                    if (high >= 0) decoded.Append((char)(high << 4));
+                    corpus.Append("\n");
+                    corpus.Append(NormalizeNameEscapes(decoded.ToString()));
+                    corpus.Append("\n");
+                    index = cursor;
+                }
+            }
+            else if (text[index] == '(')
+            {
+                var decoded = new StringBuilder();
+                int depth = 1;
+                int cursor = index + 1;
+                for (; cursor < text.Length && depth > 0; cursor++)
+                {
+                    char value = text[cursor];
+                    if (value == '\\' && cursor + 1 < text.Length)
+                    {
+                        char escaped = text[++cursor];
+                        if (escaped == '\r') { if (cursor + 1 < text.Length && text[cursor + 1] == '\n') cursor++; continue; }
+                        if (escaped == '\n') continue;
+                        if (escaped is >= '0' and <= '7')
+                        {
+                            int octal = escaped - '0';
+                            int digits = 1;
+                            while (digits < 3 && cursor + 1 < text.Length && text[cursor + 1] is >= '0' and <= '7')
+                            {
+                                octal = octal * 8 + text[++cursor] - '0';
+                                digits++;
+                            }
+                            decoded.Append((char)(octal & 0xff));
+                            continue;
+                        }
+                        decoded.Append(escaped switch
+                        {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            'b' => '\b',
+                            'f' => '\f',
+                            _ => escaped
+                        });
+                    }
+                    else if (value == '(') { depth++; decoded.Append(value); }
+                    else if (value == ')') { if (--depth > 0) decoded.Append(value); }
+                    else decoded.Append(value);
+                }
+                if (depth == 0)
+                {
+                    corpus.Append("\n");
+                    corpus.Append(NormalizeNameEscapes(decoded.ToString()));
+                    corpus.Append("\n");
+                    index = cursor - 1;
+                }
+            }
+        }
+    }
+
+    private static bool IsPdfDelimiterOrWhiteSpace(char value) =>
+        char.IsWhiteSpace(value) || value is '(' or ')' or '<' or '>' or '[' or ']' or '{' or '}' or '/' or '%';
+
+    private static int HexValue(char value) => value switch
+    {
+        >= '0' and <= '9' => value - '0',
+        >= 'a' and <= 'f' => value - 'a' + 10,
+        >= 'A' and <= 'F' => value - 'A' + 10,
+        _ => -1
+    };
+
+    private sealed class BoundedCorpus(int maxChars)
+    {
+        private readonly StringBuilder _builder = new(Math.Min(maxChars, 1024 * 1024));
+
+        public void Append(string value)
+        {
+            if ((long)_builder.Length + value.Length > maxChars)
+            {
+                throw new PdfScanException("ScanBudgetExceeded",
+                    $"The normalized PDF content exceeds the {maxChars:N0}-character scan budget.");
+            }
+            _builder.Append(value);
+        }
+
+        public override string ToString() => _builder.ToString();
+    }
+
+    private sealed class PdfScanException(string rule, string message) : Exception(message)
+    {
+        public string Rule { get; } = rule;
     }
 }

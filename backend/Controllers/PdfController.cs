@@ -1,4 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Http.Timeouts;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Options;
 using PdfSecurityApi.Models;
 using PdfSecurityApi.Security;
 
@@ -12,14 +15,14 @@ namespace PdfSecurityApi.Controllers;
 [Route("api/[controller]")]
 public class PdfController : ControllerBase
 {
-    private const long UploadLimitBytes = 12L * 1024 * 1024;
-
     private readonly PdfSecurity _pdfSecurity;
+    private readonly PdfSecurityOptions _options;
     private readonly ILogger<PdfController> _logger;
 
-    public PdfController(PdfSecurity pdfSecurity, ILogger<PdfController> logger)
+    public PdfController(PdfSecurity pdfSecurity, IOptions<PdfSecurityOptions> options, ILogger<PdfController> logger)
     {
         _pdfSecurity = pdfSecurity;
+        _options = options.Value;
         _logger = logger;
     }
 
@@ -36,9 +39,10 @@ public class PdfController : ControllerBase
     /// <response code="400">The request is missing the file or the file is not a PDF.</response>
     [HttpPost("validate")]
     [Consumes("multipart/form-data")]
-    [RequestSizeLimit(UploadLimitBytes)]
+    [EnableRateLimiting("pdf-scan")]
+    [RequestTimeout("pdf-scan")]
     [Produces("application/json")]
-    public async Task<ActionResult<PdfScanResponse>> Validate([FromForm] IFormFile file)
+    public async Task<ActionResult<PdfScanResponse>> Validate([FromForm] IFormFile? file, CancellationToken cancellationToken)
     {
         if (file is null || file.Length == 0)
         {
@@ -46,10 +50,11 @@ public class PdfController : ControllerBase
         }
 
         // Fast, cheap pre-checks: extension + content type before reading the whole payload.
-        var ext = Path.GetExtension(file.FileName);
+        var displayName = SanitizeFileName(file.FileName);
+        var ext = Path.GetExtension(displayName);
         if (!string.Equals(ext, ".pdf", StringComparison.OrdinalIgnoreCase))
         {
-            return BadRequest(new PdfScanResponse(false, false, file.FileName, file.Length,
+            return BadRequest(new PdfScanResponse(false, false, displayName, file.Length,
                 "Only PDF files are accepted.",
                 [$"Unsupported file extension '{ext}'. Please upload a .pdf file."], []));
         }
@@ -59,28 +64,38 @@ public class PdfController : ControllerBase
             !file.ContentType.Equals("application/x-pdf", StringComparison.OrdinalIgnoreCase) &&
             !file.ContentType.Equals("text/pdf", StringComparison.OrdinalIgnoreCase))
         {
-            return BadRequest(new PdfScanResponse(false, false, file.FileName, file.Length,
+            return BadRequest(new PdfScanResponse(false, false, displayName, file.Length,
                 "Only PDF files are accepted.",
                 [$"Unsupported content type '{file.ContentType}'. Expected application/pdf."], []));
         }
 
-        byte[] bytes;
-        await using (var ms = new MemoryStream())
+        if (file.Length > _options.MaxFileSizeBytes)
         {
-            await file.CopyToAsync(ms);
-            bytes = ms.ToArray();
+            return StatusCode(StatusCodes.Status413PayloadTooLarge,
+                new PdfScanResponse(false, false, displayName, file.Length, "File too large.",
+                    [$"The maximum allowed file size is {_options.MaxFileSizeBytes:N0} bytes."], []));
         }
 
-        var result = _pdfSecurity.Validate(bytes, file.FileName);
+        await using var ms = new MemoryStream(checked((int)file.Length));
+        await file.CopyToAsync(ms, cancellationToken);
+        var bytes = ms.GetBuffer();
+        var result = _pdfSecurity.Validate(bytes, checked((int)ms.Length), displayName, cancellationToken);
 
         if (!result.IsAllowed)
         {
             _logger.LogWarning("PDF rejected '{File}' ({Size} bytes): {Summary}",
-                file.FileName, result.SizeBytes, result.Summary);
+                displayName, result.SizeBytes, result.Summary);
             return Ok(PdfScanResponse.From(result));
         }
 
-        _logger.LogInformation("PDF accepted '{File}' ({Size} bytes).", file.FileName, result.SizeBytes);
+        _logger.LogInformation("PDF accepted '{File}' ({Size} bytes).", displayName, result.SizeBytes);
         return Ok(PdfScanResponse.From(result));
+    }
+
+    private static string SanitizeFileName(string fileName)
+    {
+        var name = Path.GetFileName(fileName);
+        name = new string(name.Where(character => !char.IsControl(character)).ToArray());
+        return name.Length <= 255 ? name : name[..255];
     }
 }
