@@ -1,71 +1,56 @@
-namespace PdfSecurityApi.Security;
+using System.Collections.Generic;
+using System.Linq;
 
-/// <summary>Value object describing a single dangerous construct found in a PDF.</summary>
-public sealed record PdfFinding(string Rule, string Severity, string Detail);
+// Nullable reference annotations do not exist in the C# 7.3 build used for net472.
+#pragma warning disable CS8618
 
-/// <summary>
-/// The verdict produced by <see cref="PdfSecurity.Validate(byte[], string?)"/>.
-/// </summary>
-public sealed class PdfValidationResult
+namespace PdfSecurityApi.Security
 {
-    /// <summary>true when the bytes look like a real PDF (magic header present).</summary>
-    public bool IsValidPdf { get; init; }
-
-    /// <summary>true when the document is safe to accept.</summary>
-    public bool IsAllowed { get; init; }
-
-    /// <summary>Size of the uploaded file in bytes.</summary>
-    public long SizeBytes { get; init; }
-
-    /// <summary>Original file name (as uploaded), if provided.</summary>
-    public string? FileName { get; init; }
-
-    /// <summary>Short human-readable verdict.</summary>
-    public string Summary { get; init; } = "";
-
-    /// <summary>Human-readable reasons why the file was rejected.</summary>
-    public IReadOnlyList<string> Reasons { get; init; } = [];
-
-    /// <summary>Structured list of every dangerous construct detected.</summary>
-    public IReadOnlyList<PdfFinding> Findings { get; init; } = [];
-
-    public static PdfValidationResult Ok(string? fileName, long size, string summary) => new()
+    public sealed class PdfFinding
     {
-        IsValidPdf = true,
-        IsAllowed = true,
-        SizeBytes = size,
-        FileName = fileName,
-        Summary = summary,
-        Reasons = [],
-        Findings = []
-    };
-
-    public static PdfValidationResult Rejected(
-        bool validPdf,
-        string? fileName,
-        long size,
-        string summary,
-        IReadOnlyList<PdfFinding> findings)
-    {
-        var reasons = findings
-            .Select(f => $"{f.Rule}: {f.Detail}")
-            .Distinct()
-            .ToList();
-
-        if (reasons.Count == 0)
+        public PdfFinding(string rule, string severity, string detail)
         {
-            reasons.Add(summary);
+            Rule = rule;
+            Severity = severity;
+            Detail = detail;
         }
 
-        return new PdfValidationResult
+        public string Rule { get; private set; }
+        public string Severity { get; private set; }
+        public string Detail { get; private set; }
+    }
+
+    public sealed class PdfValidationResult
+    {
+        public bool IsValidPdf { get; set; }
+        public bool IsAllowed { get; set; }
+        public long SizeBytes { get; set; }
+        public string FileName { get; set; }
+        public string Summary { get; set; } = string.Empty;
+        public IReadOnlyList<string> Reasons { get; set; } = new string[0];
+        public IReadOnlyList<PdfFinding> Findings { get; set; } = new PdfFinding[0];
+
+        public static PdfValidationResult Ok(string fileName, long size, string summary)
         {
-            IsValidPdf = validPdf,
-            IsAllowed = false,
-            SizeBytes = size,
-            FileName = fileName,
-            Summary = summary,
-            Reasons = reasons,
-            Findings = findings
-        };
+            return new PdfValidationResult
+            {
+                IsValidPdf = true, IsAllowed = true, SizeBytes = size, FileName = fileName,
+                Summary = summary, Reasons = new string[0], Findings = new PdfFinding[0]
+            };
+        }
+
+        public static PdfValidationResult Rejected(bool validPdf, string fileName, long size,
+            string summary, IReadOnlyList<PdfFinding> findings)
+        {
+            List<string> reasons = findings
+                .Select(finding => string.Format("{0}: {1}", finding.Rule, finding.Detail))
+                .Distinct().ToList();
+            if (reasons.Count == 0) reasons.Add(summary);
+            return new PdfValidationResult
+            {
+                IsValidPdf = validPdf, IsAllowed = false, SizeBytes = size, FileName = fileName,
+                Summary = summary, Reasons = reasons, Findings = findings
+            };
+        }
     }
 }

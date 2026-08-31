@@ -1,4 +1,6 @@
 <Solution>
   <Project Path="backend/PdfSecurityApi.csproj" />
   <Project Path="backend.tests/PdfSecurityApi.SecurityTests.csproj" />
+  <Project Path="backend.net472/PdfSecurity.NetFramework.csproj" />
+  <Project Path="backend.net472.tests/PdfSecurity.NetFramework.Tests.csproj" />
 </Solution>

@@ -42,6 +42,8 @@ backend/        ASP.NET Core Web API (net10.0)
     PdfValidationResult.cs      # verdict DTO
   Controllers/PdfController.cs  # POST /api/pdf/validate + GET /api/pdf/health
   Models/PdfScanResponse.cs     # API response
+backend.net472/ .NET Framework 4.7.2 class library, linked to the same security sources
+backend.net472.tests/ Framework compatibility regression executable
 frontend/       React 18 + TypeScript + Vite
   src/App.tsx                   # file upload -> POST form -> show pass/error
 benign.pdf      a clean sample PDF for testing the "allowed" path
@@ -83,6 +85,38 @@ dotnet run --project backend.tests/PdfSecurityApi.SecurityTests.csproj
 The suite covers a clean document, fake structure, plaintext JavaScript, PDF name escapes,
 hexadecimal JavaScript strings, encryption, unsupported filters, decoded ASCIIHex content, and a
 decompression-limit bypass.
+
+## Use from .NET Framework 4.7.2
+
+Build `backend.net472/PdfSecurity.NetFramework.csproj` and reference the resulting
+`PdfSecurity.NetFramework.dll` from the .NET Framework application. The project links the exact
+three scanner files used by the .NET 10 API, so both targets have the same rules, configuration,
+decoded-stream inspection, structural checks, cancellation support, and resource limits.
+
+```powershell
+dotnet build backend.net472/PdfSecurity.NetFramework.csproj -c Release
+# Run the compatibility regression executable on Windows/.NET Framework 4.7.2+
+backend.net472.tests\bin\Release\net472\PdfSecurity.NetFramework.Tests.exe
+```
+
+```csharp
+using PdfSecurityApi.Security;
+
+var scanner = new PdfSecurity(new PdfSecurityOptions
+{
+    MaxFileSizeBytes = 10 * 1024 * 1024
+});
+
+PdfValidationResult result = scanner.Validate(pdfBytes, uploadedFileName);
+if (!result.IsAllowed)
+{
+    // Reject the upload and display/log result.Reasons.
+}
+```
+
+The compatibility project has no NuGet dependencies. PDF `FlateDecode` streams are decoded with
+the .NET Framework `DeflateStream` after validating the zlib wrapper, and the Adler-32 checksum is
+verified before the decoded bytes are scanned.
 
 ### API contract
 `POST /api/pdf/validate` (multipart/form-data, field `file`):
